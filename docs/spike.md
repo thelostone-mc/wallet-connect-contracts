@@ -255,7 +255,7 @@ Let's walk through an example
        - **Drift: 1 vote**
        - **Root cause**: The bias decay calculation doesn't account for mid-period slope expirations. It only processes expirations when creating a new checkpoint, but uses the old aggregated slope for the entire decay period.
 
-- **Option E** (Piecewise Bias Calculation to Eliminate Drift):
+## Option E (Piecewise Bias Calculation to Eliminate Drift):
 
 Same as Option D, but when calculating bias decay, iterate through time periods and apply slopeExpiry changes at their respective timestamps, similar to how `_totalSupplyAt` works in StakeWeight.
 
