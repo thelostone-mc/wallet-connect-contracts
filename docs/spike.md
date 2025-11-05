@@ -38,11 +38,11 @@ Proposed Solution
 
 ## Potential Solution
 
-- **Option A** (Leave as is - Doesn't accurately account for decay rate)
+### Option A (Leave as is - Doesn't accurately account for decay rate)
   - Keep track of delegated power for each user
   - Rely on delegatee updating their stake , causing an update on the delegated checkpoint of the delegated user
 
-- **Option B** (Iterate through all delegatorsOf and compute actual weight):
+### Option B (Iterate through all delegatorsOf and compute actual weight):
   - Add reverse mapping: `mapping(address delegatee => address[] delegators) delegatorsOf`
   - Maintain this mapping on every delegation change (add/remove delegators from array)
   - When calculating voting power:
@@ -52,7 +52,7 @@ Proposed Solution
     - Same approach for `getPastVotes` - calculate each delegator's weight at snapshot time, then sum
   - **Tradeoff**: Accurate but O(N) gas cost where N = number of delegators. Gets expensive if delegatee has 100s of delegators.
 
-- **Option C** (Slope Aggregated Per Delegate - Efficient but small drift possible):
+### Option C (Slope Aggregated Per Delegate - Efficient but small drift possible):
   - Given that decay rate is linear, aggregate slopes and biases per delegatee
   - When a delegator delegates, add their slope (decay rate) and bias (initial votes) to the delegatee's totals
   - Store aggregated totals in delegation checkpoints: `{fromBlock, totalSlope, totalBias}`
@@ -139,14 +139,14 @@ Note: The drift does build up over time, so that might be an issue
 Curious if there is a way we could remove the expired delegations.
 
 
-- **Option D** (Slope Aggregated Per Delegate With Future Reduction Slope Tracking ):
+### Option D (Slope Aggregated Per Delegate With Future Reduction Slope Tracking ):
 
 Basically same as Option C but introduces a mapping slopeExpiry[delegatee][timestamp] to track when individual delegations will expire in the future.
 When a delegation is created, its slope reduction is scheduled at the expiration timestamp -> e.g. slopeExpiry[Alice][t1] = -1 means that 1 slope unit should be removed when t1 arrives.
 However, these expirations are not automatically applied -> they're only processed the next time someone interacts (like a new delegation or undelegation).
 This can lead to minor drift between "true" off-chain bias and what's on-chain until an update occurs.
 
-## Option D Example Walkthrough
+**Example Walkthrough**
 
 Let's walk through an example
   - `MAX_LOCK_CAP = 209 weeks`
@@ -255,7 +255,7 @@ Let's walk through an example
        - **Drift: 1 vote**
        - **Root cause**: The bias decay calculation doesn't account for mid-period slope expirations. It only processes expirations when creating a new checkpoint, but uses the old aggregated slope for the entire decay period.
 
-## Option E (Piecewise Bias Calculation to Eliminate Drift):
+### Option E (Piecewise Bias Calculation to Eliminate Drift):
 
 Same as Option D, but when calculating bias decay, iterate through time periods and apply slopeExpiry changes at their respective timestamps, similar to how `_totalSupplyAt` works in StakeWeight.
 
@@ -267,7 +267,7 @@ Do piecewise:
 
 This eliminates drift by accounting for slope changes during the decay period, not just at checkpoint creation time.
 
-### Storage Walkthrough: How slopeExpiry is Stored Step-by-Step
+**Storage Walkthrough: How slopeExpiry is Stored Step-by-Step**
 
 **Setup at t0:**
 - Bob stakes 418 WCT for 2 weeks → slope=2, bias=4, expires at t2
@@ -421,7 +421,7 @@ slopeExpiry[Alice] = {
    - Check `slopeExpiry[Alice][weekCursor]` at each week
    - Apply any found slope changes
 
-### Example: Querying at t5 (3 weeks after checkpoint)
+#### Example: Querying at t5 (3 weeks after checkpoint)
 
 Let's see how `getPastVotesAt(t5)` works with Option E:
 
