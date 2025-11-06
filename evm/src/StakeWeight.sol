@@ -1585,6 +1585,74 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         _delegate(signer, delegatee);
     }
 
+    /// @notice Calculate delegation bias and slope at a specific timestamp using piecewise decay
+    /// @param delegatee The delegatee address
+    /// @param timestamp The timestamp to calculate bias at
+    /// @return bias The decayed bias at the timestamp
+    /// @return slope The current slope at the timestamp (after applying expirations)
+    function _delegationBiasAt(address delegatee, uint256 timestamp) internal view returns (int128 bias, int128 slope) {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+        uint256 delegationPointsLength = s.delegationPoints[delegatee].length;
+
+        // If no checkpoints exist, return zero
+        if (delegationPointsLength == 0) {
+            return (0, 0);
+        }
+
+        // Get the most recent checkpoint
+        Point memory lastPoint = s.delegationPoints[delegatee][delegationPointsLength - 1];
+
+        // If timestamp is before the checkpoint, return checkpoint values (shouldn't happen in practice)
+        if (timestamp < lastPoint.timestamp) {
+            return (lastPoint.bias, lastPoint.slope);
+        }
+
+        // If timestamp equals checkpoint timestamp, return checkpoint values directly
+        if (timestamp == lastPoint.timestamp) {
+            return (lastPoint.bias, lastPoint.slope);
+        }
+
+        // Perform piecewise decay from checkpoint timestamp to target timestamp
+        uint256 weekCursor = _timestampToFloorWeek(lastPoint.timestamp);
+
+        // Iterate through weeks to apply slopeExpiry changes
+        for (uint256 i = 0; i < MAX_CHECKPOINT_ITERATIONS; i++) {
+            weekCursor = weekCursor + 1 weeks;
+            int128 slopeDelta = 0;
+
+            if (weekCursor > timestamp) {
+                // If weekCursor goes beyond timestamp, set to timestamp and don't check slopeExpiry
+                weekCursor = timestamp;
+            } else {
+                // Check for slope expiry at this week boundary
+                slopeDelta = s.delegationSlopeExpiry[delegatee][weekCursor];
+            }
+
+            // Decay bias from lastPoint.timestamp to weekCursor
+            int128 timeElapsed = SafeCast.toInt128(int256(weekCursor - lastPoint.timestamp));
+            lastPoint.bias = lastPoint.bias - (lastPoint.slope * timeElapsed);
+
+            // Clamp bias to zero if negative
+            if (lastPoint.bias < 0) {
+                lastPoint.bias = 0;
+            }
+
+            // If we've reached the target timestamp, break
+            if (weekCursor == timestamp) {
+                break;
+            }
+
+            // Apply slope change from expirations and update timestamp
+            lastPoint.slope = lastPoint.slope - slopeDelta; // Subtract because expirations reduce slope
+            if (lastPoint.slope < 0) {
+                lastPoint.slope = 0;
+            }
+            lastPoint.timestamp = weekCursor;
+        }
+
+        return (lastPoint.bias, lastPoint.slope);
+    }
+
     /// @notice Internal function to delegate votes from an account to a delegatee
     /// @param account The account to delegate from
     /// @param delegatee The address to delegate to
@@ -1598,22 +1666,16 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         // Update delegation storage
         s.delegates[account] = delegatee;
 
-        // Create a new point for the delegation
+        // Calculate current bias and slope at block.timestamp using piecewise decay
+        (int128 currentBias, int128 currentSlope) = _delegationBiasAt(delegatee, block.timestamp);
+
+        // Create a new point for the delegation starting from current decayed values
         Point memory newPointForDelegatee = Point({
-            bias: 0,
-            slope: 0,
+            bias: currentBias,
+            slope: currentSlope,
             timestamp: block.timestamp,
             blockNumber: block.number
         });
-
-        // Retrieve latest point from delegation points
-        uint256 delegationPointsLength = s.delegationPoints[delegatee].length;
-        if (delegationPointsLength > 0) {
-            // Ensure we copy over the bias and slope from the latest point to the new point
-            Point memory latestPoint = s.delegationPoints[delegatee][delegationPointsLength - 1];
-            newPointForDelegatee.bias = latestPoint.bias;
-            newPointForDelegatee.slope = latestPoint.slope;
-        }
 
         // Update the slope and bias based on the type of lock (permanent or decay lock)
         if (s.isPermanent[account]) {
@@ -1641,22 +1703,16 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         // Check if this delegation transfer
         // If it is, we need to update the delegation points and slope expiry for the old delegatee
         if (oldDelegatee != address(0)) {
-            // Create a new point for the old delegate
+            // Calculate current bias and slope at block.timestamp using piecewise decay
+            (int128 currentBiasOld, int128 currentSlopeOld) = _delegationBiasAt(oldDelegatee, block.timestamp);
+
+            // Create a new point for the old delegate starting from current decayed values
             Point memory newPointForOldDelegatee = Point({
-                bias: 0,
-                slope: 0,
+                bias: currentBiasOld,
+                slope: currentSlopeOld,
                 timestamp: block.timestamp,
                 blockNumber: block.number
             });
-
-            // Retrieve latest point from delegation points
-            uint256 delegationPointsLengthForOldDelegatee = s.delegationPoints[oldDelegatee].length;
-            if (delegationPointsLengthForOldDelegatee > 0) {
-                // Ensure we copy over the bias and slope from the latest point to the new point
-                Point memory latestPoint = s.delegationPoints[oldDelegatee][delegationPointsLengthForOldDelegatee - 1];
-                newPointForOldDelegatee.bias = latestPoint.bias;
-                newPointForOldDelegatee.slope = latestPoint.slope;
-            }
 
             // Update the slope and bias based on the type of lock (permanent or decay lock)
             if (s.isPermanent[account]) {
