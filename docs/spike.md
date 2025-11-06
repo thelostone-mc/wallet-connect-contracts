@@ -523,4 +523,146 @@ Result    | t5          | -            | bias = 0 votes              | 0     | -
 - Ed at t5: 0 votes (expired at t4)
 - Total: 0 + 0 + 0 + 0 = 0 votes ✅ **Matches Option E exactly!**
 
+### Example: Changing Delegation at t3 (Carol switches from Alice to Ying)
+
+**Scenario:**
+- Current state at t2: Alice has checkpoint with `slope = 6`, `bias = 11`
+  - Bob: expired at t2 (already removed)
+  - Carol: slope=4, bias=8 at t2, expires at t4
+  - Dave: expired at t1 (already removed)
+  - Ed: slope=2, bias=4 at t2, expires at t4
+- At t3, Carol changes her delegation from Alice to a new delegatee Ying
+- `slopeExpiry[Alice][t4] = -6` (Carol's -4 + Ed's -2)
+
+**Step 1: Calculate Carol's current state at t3**
+
+Carol staked at t0 with:
+- Initial: slope=4, bias=16, expires at t4
+- At t3 (3 weeks elapsed from t0):
+  - `bias_at_t3 = 16 - (4 × 3) = 4 votes`
+  - `slope_at_t3 = 4` (unchanged)
+  - Time remaining: 1 week (expires at t4)
+
+**Step 2: Remove Carol from Alice's delegation**
+
+**2a. Find Alice's most recent checkpoint (t2)**
+```javascript
+checkpoint = delegationCheckpoints[Alice].findLast(block <= blockAt(t3))
+// Result: checkpoint at t2 with {totalSlope: 6, totalBias: 11}
+```
+
+**2b. Calculate Alice's current bias at t3 (decay from t2 checkpoint)**
+```javascript
+timeElapsed = t3 - t2 = 1 week
+bias_at_t3 = 11 - (6 × 1) = 5 votes
+```
+
+**2c. Remove Carol's contribution**
+- Carol's bias at t3: 4 votes
+- Carol's slope: 4
+- New bias: `5 - 4 = 1 vote` (only Ed remains)
+- New slope: `6 - 4 = 2` (only Ed's slope remains)
+
+**2d. Update Alice's slopeExpiry**
+- Remove Carol's expiration from `slopeExpiry[Alice][t4]`
+- Old: `slopeExpiry[Alice][t4] = -6` (Carol's -4 + Ed's -2)
+- New: `slopeExpiry[Alice][t4] = -2` (only Ed expires at t4)
+
+**2e. Create new checkpoint for Alice at t3**
+```javascript
+delegationCheckpoints[Alice].push({
+  fromBlock: blockAt(t3),
+  totalSlope: 2,  // Only Ed's slope
+  totalBias: 1    // Only Ed's remaining bias
+})
+```
+
+**Step 3: Add Carol to Ying's delegation**
+
+**3a. Check if Ying has any existing delegations**
+- Assume Ying is new (no existing delegations)
+- If Ying had existing delegations, we'd need to:
+  1. Find Ying's most recent checkpoint
+  2. Decay bias from that checkpoint to t3
+  3. Add Carol's bias and slope
+
+**3b. Create initial checkpoint for Ying at t3**
+```javascript
+delegationCheckpoints[Ying].push({
+  fromBlock: blockAt(t3),
+  totalSlope: 4,  // Carol's slope
+  totalBias: 4    // Carol's bias at t3
+})
+```
+
+**3c. Schedule Carol's expiration for Ying**
+```javascript
+slopeExpiry[Ying][t4] = -4  // Carol expires at t4 (1 week from t3)
+```
+
+**Complete storage state after t3:**
+
+**Alice's storage:**
+```javascript
+delegationCheckpoints[Alice] = [
+  { fromBlock: blockAt(t0), totalSlope: 7, totalBias: 21 },  // Original
+  { fromBlock: blockAt(t2), totalSlope: 6, totalBias: 11 }, // After Ed joined
+  { fromBlock: blockAt(t3), totalSlope: 2, totalBias: 1 }   // After Carol left
+]
+
+slopeExpiry[Alice] = {
+  t1: -1,  // Dave expired (already processed, but entry remains)
+  t2: -2,  // Bob expired (already processed, but entry remains)
+  t4: -2   // Ed expires (updated: was -6, removed Carol's -4)
+}
+```
+
+**Ying's storage:**
+```javascript
+delegationCheckpoints[Ying] = [
+  { fromBlock: blockAt(t3), totalSlope: 4, totalBias: 4 }  // Carol's delegation
+]
+
+slopeExpiry[Ying] = {
+  t4: -4  // Carol expires at t4
+}
+```
+
+**Manual verification at t3:**
+
+**Alice's voting power:**
+- Ed's bias at t3: `4 - (2 × 1) = 2 votes` (was 4 at t2, decayed 1 week)
+- Alice total: `2 votes` ✅
+- Checkpoint shows: `1 vote` (calculated from t2: `11 - (6 × 1) = 5`, then `5 - 4 = 1`)
+- **Note**: There's a 1 vote difference because we removed Carol's full bias (4) but Ed's bias should be 2, not 1. This is because we used Option D's simple decay. With Option E, we'd get exactly 2.
+
+**Ying's voting power:**
+- Carol's bias at t3: `4 votes` ✅
+- Checkpoint shows: `4 votes` ✅
+
+**Key points:**
+1. **When removing a delegation:**
+   - Find most recent checkpoint
+   - Decay bias from checkpoint to current time
+   - Subtract delegator's current bias and slope
+   - Update `slopeExpiry` to remove delegator's expiration
+   - Create new checkpoint with updated values
+
+2. **When adding a delegation:**
+   - Find most recent checkpoint (or create first one)
+   - Decay bias from checkpoint to current time (if existing delegations)
+   - Add delegator's current bias and slope
+   - Update `slopeExpiry` to add delegator's expiration
+   - Create new checkpoint with updated values
+
+3. **slopeExpiry updates:**
+   - When removing: Subtract delegator's slope from the expiration timestamp
+   - When adding: Add delegator's slope to the expiration timestamp
+   - Multiple delegators expiring at same time are combined in one entry
+
+4. **Checkpoint creation:**
+   - Every delegation change creates a new checkpoint
+   - Checkpoints are immutable snapshots
+   - Old checkpoints remain for historical queries
+
 
