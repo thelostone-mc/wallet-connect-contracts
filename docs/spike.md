@@ -142,7 +142,7 @@ Curious if there is a way we could remove the expired delegations.
 ### Option D (Slope Aggregated Per Delegate With Future Reduction Slope Tracking ):
 
 Basically same as Option C but introduces a mapping slopeExpiry[delegatee][timestamp] to track when individual delegations will expire in the future.
-When a delegation is created, its slope reduction is scheduled at the expiration timestamp -> e.g. slopeExpiry[Alice][t1] = -1 means that 1 slope unit should be removed when t1 arrives.
+When a delegation is created, its slope reduction is scheduled at the expiration timestamp -> e.g. slopeExpiry[Alice][t1] = 1 means that 1 slope unit should be removed when t1 arrives.
 However, these expirations are not automatically applied -> they're only processed the next time someone interacts (like a new delegation or undelegation).
 This can lead to minor drift between "true" off-chain bias and what's on-chain until an update occurs.
 
@@ -171,9 +171,9 @@ Let's walk through an example
         totalBias: 21
       })
 
-      slopeExpiry[Alice][t1] = -1; // Dave expires
-      slopeExpiry[Alice][t2] = -2; // Bob expires
-      slopeExpiry[Alice][t4] = -4; // Carol expires
+      slopeExpiry[Alice][t1] = 1; // Dave expires
+      slopeExpiry[Alice][t2] = 2; // Bob expires
+      slopeExpiry[Alice][t4] = 4; // Carol expires
       ```
   - At `t1` (1 week) (1 week is over)
     - Assume no one has interacted with their stake, so **no checkpoint is written**
@@ -209,9 +209,9 @@ Let's walk through an example
       - bias: `2*2` => `4 votes`
       - Ed delegates to Alice
     - **Step 1: Contract processes pending expirations first**
-      - Checks `slopeExpiry[Alice][t1] = -1` (Dave expired, but wasn't removed yet)
-      - Checks `slopeExpiry[Alice][t2] = -2` (Bob expired, but wasn't removed yet)
-      - Total slope reduction needed: `-1 + (-2) = -3`
+      - Checks `slopeExpiry[Alice][t1] = 1` (Dave expired, but wasn't removed yet)
+      - Checks `slopeExpiry[Alice][t2] = 2` (Bob expired, but wasn't removed yet)
+      - Total slope reduction needed: `1 + 2 = 3`
       - These expired slopes need to be removed from the total
     - **Step 2: Calculate current bias from t0 checkpoint**
       - Time elapsed from t0 to t2: `2 weeks`
@@ -234,8 +234,8 @@ Let's walk through an example
       })
       ```
       - Schedule Ed's future expiration:
-        - `slopeExpiry[Alice][t4] += -2` (Ed expires at t4, will reduce slope by 2)
-        - Note: Carol also expires at t4, so `slopeExpiry[Alice][t4]` now equals `-4 + (-2) = -6`
+        - `slopeExpiry[Alice][t4] += 2` (Ed expires at t4, will reduce slope by 2)
+        - Note: Carol also expires at t4, so `slopeExpiry[Alice][t4]` now equals `4 + 2 = 6`
     - **Result at t2**:
       - New checkpoint shows: `bias = 11 votes`, `slope = 6`
       - If queried at t2: `11 votes` (no elapsed time from this checkpoint)
@@ -261,7 +261,7 @@ Same as Option D, but when calculating bias decay, iterate through time periods 
 
 Instead of: `bias_at_t2 = 21 - (7 × 2) = 7` (uses one slope for entire period)
 Do piecewise:
-  - Week 1: `bias = 21 - (7 × 1) = 14`, then apply `slopeExpiry[t1] = -1`, slope becomes `6`
+  - Week 1: `bias = 21 - (7 × 1) = 14`, then check `slopeExpiry[t1] = 1`, subtract it: slope becomes `7 - 1 = 6`
   - Week 2: `bias = 14 - (6 × 1) = 8`
   - Add new delegation: `8 + 4 = 12` ✅ (matches manual calculation exactly!)
 
@@ -285,7 +285,7 @@ delegationCheckpoints[Alice].push({
 })
 
 // Store Bob's expiration
-slopeExpiry[Alice][t2] = -2  // Bob's slope expires at t2
+slopeExpiry[Alice][t2] = 2  // Bob's slope expires at t2
 ```
 
 **Current storage state:**
@@ -295,7 +295,7 @@ delegationCheckpoints[Alice] = [
 ]
 
 slopeExpiry[Alice] = {
-  t2: -2  // Bob expires
+  t2: 2  // Bob expires
 }
 ```
 
@@ -312,7 +312,7 @@ delegationCheckpoints[Alice].push({
 })
 
 // Store Carol's expiration
-slopeExpiry[Alice][t4] = -4  // Carol's slope expires at t4
+slopeExpiry[Alice][t4] = 4  // Carol's slope expires at t4
 ```
 
 **Current storage state:**
@@ -322,8 +322,8 @@ delegationCheckpoints[Alice] = [
 ]
 
 slopeExpiry[Alice] = {
-  t2: -2,  // Bob expires
-  t4: -4   // Carol expires
+  t2: 2,  // Bob expires
+  t4: 4   // Carol expires
 }
 ```
 
@@ -340,7 +340,7 @@ delegationCheckpoints[Alice].push({
 })
 
 // Store Dave's expiration
-slopeExpiry[Alice][t1] = -1  // Dave's slope expires at t1
+slopeExpiry[Alice][t1] = 1  // Dave's slope expires at t1
 ```
 
 **Final storage state at t0:**
@@ -350,9 +350,9 @@ delegationCheckpoints[Alice] = [
 ]
 
 slopeExpiry[Alice] = {
-  t1: -1,  // Dave expires (1 week)
-  t2: -2,  // Bob expires (2 weeks)
-  t4: -4   // Carol expires (4 weeks)
+  t1: 1,  // Dave expires (1 week)
+  t2: 2,  // Bob expires (2 weeks)
+  t4: 4   // Carol expires (4 weeks)
 }
 ```
 
@@ -365,12 +365,12 @@ bias = 21, slope = 7
 
 // Week 1 (t0 → t1)
 bias = 21 - (7 × 1) = 14
-// Check slopeExpiry[Alice][t1] = -1 (Dave expires)
+// Check slopeExpiry[Alice][t1] = 1 (Dave expires)
 slope = 7 - 1 = 6
 
 // Week 2 (t1 → t2)
 bias = 14 - (6 × 1) = 8
-// Check slopeExpiry[Alice][t2] = -2 (Bob expires)
+// Check slopeExpiry[Alice][t2] = 2 (Bob expires)
 slope = 6 - 2 = 4
 
 // Result: bias_at_t2 = 8, slope_at_t2 = 4
@@ -389,7 +389,7 @@ delegationCheckpoints[Alice].push({
 
 // Store Ed's expiration
 // Carol already expires at t4, so we ADD to existing entry
-slopeExpiry[Alice][t4] = -4 + (-2) = -6  // Carol + Ed both expire at t4
+slopeExpiry[Alice][t4] = 4 + 2 = 6  // Carol + Ed both expire at t4
 ```
 
 **Storage state after Ed delegates:**
@@ -400,20 +400,20 @@ delegationCheckpoints[Alice] = [
 ]
 
 slopeExpiry[Alice] = {
-  t1: -1,  // Dave expires (already expired at t1, but entry remains)
-  t2: -2,  // Bob expires (already expired at t2, but entry remains)
-  t4: -6   // Carol + Ed expire (both expire at t4)
+  t1: 1,  // Dave expires (already expired at t1, but entry remains)
+  t2: 2,  // Bob expires (already expired at t2, but entry remains)
+  t4: 6   // Carol + Ed expire (both expire at t4)
 }
 ```
 
 **Important notes about storage:**
 
 1. **`slopeExpiry` entries persist even after expiration:**
-   - `t1: -1` and `t2: -2` remain in storage
+   - `t1: 1` and `t2: 2` remain in storage
    - They're checked during piecewise calculation but don't affect future queries once processed
 
 2. **Multiple expirations at the same timestamp are combined:**
-   - `t4: -6` = Carol's `-4` + Ed's `-2`
+   - `t4: 6` = Carol's `4` + Ed's `2`
 
 3. **When querying at a future time, we:**
    - Start from the most recent checkpoint (t2)
@@ -428,7 +428,7 @@ Let's see how `getPastVotesAt(t5)` works with Option E:
 **Scenario:**
 - Last checkpoint at t2: `bias = 12`, `slope = 6`
 - Query at t5 (3 weeks after t2)
-- `slopeExpiry[Alice]` has entries at: `t1: -1`, `t2: -2`, `t4: -6`
+- `slopeExpiry[Alice]` has entries at: `t1: 1`, `t2: 2`, `t4: 6`
 
 **Step 1: Find most recent checkpoint before t5**
 ```javascript
@@ -472,10 +472,10 @@ timeElapsed = t4 - t3 = 1 week
 bias = 6 - (6 × 1) = 0
 
 // Check slopeExpiry at t4
-slopeExpiry[Alice][t4] → -6 (Carol + Ed expire!)
+slopeExpiry[Alice][t4] → 6 (Carol + Ed expire!)
 
 // Apply slope change
-slope = 6 + (-6) = 0
+slope = 6 - 6 = 0
 
 // Continue (t4 != t5)
 ```
@@ -504,7 +504,7 @@ Iteration | Week Cursor | Time Elapsed | Bias Calculation           | Slope | Ch
 ----------|-------------|--------------|----------------------------|-------|-------------------------|------------------
 Start     | t2          | -            | bias = 12                  | 6     | -                       | From checkpoint
 1         | t3          | 1 week       | bias = 12 - (6 × 1) = 6    | 6     | slopeExpiry[t3] = 0     | No change, continue
-2         | t4          | 1 week       | bias = 6 - (6 × 1) = 0     | 0     | slopeExpiry[t4] = -6    | Apply: slope = 6 - 6 = 0, continue
+2         | t4          | 1 week       | bias = 6 - (6 × 1) = 0     | 0     | slopeExpiry[t4] = 6     | Apply: slope = 6 - 6 = 0, continue
 3         | t5          | 1 week       | bias = 0 - (0 × 1) = 0     | 0     | slopeExpiry[t5] = 0     | No change, break
 Result    | t5          | -            | bias = 0 votes              | 0     | -                       | ✅ All expired
 ```
@@ -532,7 +532,7 @@ Result    | t5          | -            | bias = 0 votes              | 0     | -
   - Dave: expired at t1 (already removed)
   - Ed: slope=2, bias=4 at t2, expires at t4
 - At t3, Carol changes her delegation from Alice to a new delegatee Ying
-- `slopeExpiry[Alice][t4] = -6` (Carol's -4 + Ed's -2)
+- `slopeExpiry[Alice][t4] = 6` (Carol's 4 + Ed's 2)
 
 **Step 1: Calculate Carol's current state at t3**
 
@@ -565,8 +565,8 @@ bias_at_t3 = 11 - (6 × 1) = 5 votes
 
 **2d. Update Alice's slopeExpiry**
 - Remove Carol's expiration from `slopeExpiry[Alice][t4]`
-- Old: `slopeExpiry[Alice][t4] = -6` (Carol's -4 + Ed's -2)
-- New: `slopeExpiry[Alice][t4] = -2` (only Ed expires at t4)
+- Old: `slopeExpiry[Alice][t4] = 6` (Carol's 4 + Ed's 2)
+- New: `slopeExpiry[Alice][t4] = 2` (only Ed expires at t4)
 
 **2e. Create new checkpoint for Alice at t3**
 ```javascript
@@ -597,7 +597,7 @@ delegationCheckpoints[Ying].push({
 
 **3c. Schedule Carol's expiration for Ying**
 ```javascript
-slopeExpiry[Ying][t4] = -4  // Carol expires at t4 (1 week from t3)
+slopeExpiry[Ying][t4] = 4  // Carol expires at t4 (1 week from t3)
 ```
 
 **Complete storage state after t3:**
@@ -611,9 +611,9 @@ delegationCheckpoints[Alice] = [
 ]
 
 slopeExpiry[Alice] = {
-  t1: -1,  // Dave expired (already processed, but entry remains)
-  t2: -2,  // Bob expired (already processed, but entry remains)
-  t4: -2   // Ed expires (updated: was -6, removed Carol's -4)
+  t1: 1,  // Dave expired (already processed, but entry remains)
+  t2: 2,  // Bob expired (already processed, but entry remains)
+  t4: 2   // Ed expires (updated: was 6, removed Carol's 4)
 }
 ```
 
@@ -624,7 +624,7 @@ delegationCheckpoints[Ying] = [
 ]
 
 slopeExpiry[Ying] = {
-  t4: -4  // Carol expires at t4
+  t4: 4  // Carol expires at t4
 }
 ```
 
@@ -656,9 +656,10 @@ slopeExpiry[Ying] = {
    - Create new checkpoint with updated values
 
 3. **slopeExpiry updates:**
-   - When removing: Subtract delegator's slope from the expiration timestamp
-   - When adding: Add delegator's slope to the expiration timestamp
+   - When removing: Subtract delegator's slope from the expiration timestamp (e.g., `slopeExpiry[delegatee][expiry] -= delegatorSlope`)
+   - When adding: Add delegator's slope to the expiration timestamp (e.g., `slopeExpiry[delegatee][expiry] += delegatorSlope`)
    - Multiple delegators expiring at same time are combined in one entry
+   - Note: Values are stored as positive numbers representing the amount of slope to subtract when the expiration occurs
 
 4. **Checkpoint creation:**
    - Every delegation change creates a new checkpoint

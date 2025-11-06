@@ -5,10 +5,13 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import { AccessControlUpgradeable } from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import { ReentrancyGuardUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import { EIP712Upgradeable } from "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
+import { NoncesUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/NoncesUpgradeable.sol";
 import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IVotes } from "@openzeppelin/contracts/governance/utils/IVotes.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import { Pauser } from "./Pauser.sol";
 import { WalletConnectConfig } from "./WalletConnectConfig.sol";
@@ -21,7 +24,7 @@ import { L2WCT } from "./L2WCT.sol";
  * @author WalletConnect
  */
 
-contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, IVotes {
+contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, IVotes, EIP712Upgradeable, NoncesUpgradeable {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////////////////
@@ -38,14 +41,6 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         uint256 timestamp;
         /// @notice The block number of the point
         uint256 blockNumber;
-    }
-
-    /// @notice A checkpoint for tracking delegated voting power over time
-    struct DelegationPoint {
-        /// @notice The block number when this checkpoint was created at
-        uint32 fromBlock;
-        /// @notice Total votes delegated to the delegatee at this checkpoint
-        uint224 votes;
     }
 
     /// @notice A struct representing a locked balance
@@ -91,6 +86,8 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
     // @dev Role for the locked token staker, needs to happen after deployment for circular dependency
     bytes32 public constant LOCKED_TOKEN_STAKER_ROLE = keccak256("LOCKED_TOKEN_STAKER_ROLE");
 
+    bytes32 private constant DELEGATION_TYPEHASH = keccak256("Delegation(address delegatee,uint256 nonce,uint256 expiry)");
+
     /*//////////////////////////////////////////////////////////////////////////
                                     STORAGE
     //////////////////////////////////////////////////////////////////////////*/
@@ -132,8 +129,11 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
 
         /// ---------------- Delegation storage ----------------
         mapping(address => address) delegates; // maps account to their delegatee
-        mapping(address => uint256)  delegationNonces; // Nonces for delegateBySig
-        mapping(address => DelegationPoint[]) delegationCheckpoints; // Checkpoints for delegation.
+        mapping(address => uint256) delegationNonces; // Nonces for delegateBySig
+        mapping(address => Point[]) delegationPoints; // Checkpoints for delegation.
+        mapping(address =>
+            mapping(uint256 timestamp => int128 slopeExpiry)
+        ) delegationSlopeExpiry; // Slope expiry for delegation.
     }
 
     function _getStakeWeightStorage() internal pure returns (StakeWeightStorage storage s) {
@@ -1511,18 +1511,12 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
 
     // ----- Delegation -----
 
-
-    /// @dev Existing functions return stake weight and don't change:
-    ///      New functions return delegated voting power.
-    ///      Delegation doesn't change what someone has staked -> it changes what they can vote with.
-
-
     /// @notice Update the delegation storage vars when weight changes
-    function _updateDelegateVotes(address user, uint256 oldWeight, uint256 newWeight) internal {
+    // function _updateDelegateVotes(address user, uint256 oldWeight, uint256 newWeight) internal {
         /// Currently: Any time weight changes, we call update _checkpoint()
         /// Changes to make: Update _checkpoint() to invoke _updateDelegateVotes()
         /// NOTE: Will have to account for both permanent lock and decay lock to see how that affects the delegation updates
-    }
+    // }
 
     /// @notice Get the current voting power of an account
     function getVotes(address account) external view returns (uint256) {
@@ -1531,9 +1525,12 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         /// Assuming no one has delegated to her, she will still have 0 votes cause she has not self delegated
 
 
-        // We could do check to see if delegration checkpoint does not exist -> create a new one
+        // We could do check to see if delegation checkpoint does not exist -> create a new one
         // We might have to do the same for getPastVotes
+    }
 
+    function syncDelegation(address account) external {
+        // Sync the delegation points and slope expiry for the account
     }
 
     /// @notice Returns the amount of votes that `account` had at a specific moment in the past.
@@ -1547,17 +1544,142 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
     }
 
     /// @notice Returns the delegate that `account` has chosen.
+    /// @param account The account to query
+    /// @return The delegate of the account
     function delegates(address account) external view returns (address) {
-        // TODO
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+       return s.delegates[account];
     }
 
     /// @notice Delegate votes from the sender to `delegatee`.
+    /// @param delegatee The address to delegate to
     function delegate(address delegatee) external {
-        // TODO
+        _delegate(msg.sender, delegatee);
     }
 
     /// @notice Delegates votes from signer to `delegatee`.
-    function delegateBySig(address delegatee, uint256 nonce, uint256 expiry, uint8 v, bytes32 r, bytes32 s) external {
-        // TODO
+    /// @param delegatee The address to delegate to
+    /// @param nonce The nonce for the signature
+    /// @param expiry The expiry for the signature
+    /// @param v The v component of the signature
+    /// @param r The r component of the signature
+    /// @param s The s component of the signature
+    function delegateBySig(
+        address delegatee,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        if (block.timestamp > expiry) {
+            revert VotesExpiredSignature(expiry);
+        }
+        address signer = ECDSA.recover(
+            _hashTypedDataV4(keccak256(abi.encode(DELEGATION_TYPEHASH, delegatee, nonce, expiry))),
+            v,
+            r,
+            s
+        );
+        _useCheckedNonce(signer, nonce);
+        _delegate(signer, delegatee);
+    }
+
+    /// @notice Internal function to delegate votes from an account to a delegatee
+    /// @param account The account to delegate from
+    /// @param delegatee The address to delegate to
+    function _delegate(address account, address delegatee) internal {
+
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+        address oldDelegatee = s.delegates[account];
+
+        emit DelegateChanged(account, oldDelegatee, delegatee);
+
+        // Update delegation storage
+        s.delegates[account] = delegatee;
+
+        // Create a new point for the delegation
+        Point memory newPointForDelegatee = Point({
+            bias: 0,
+            slope: 0,
+            timestamp: block.timestamp,
+            blockNumber: block.number
+        });
+
+        // Retrieve latest point from delegation points
+        uint256 delegationPointsLength = s.delegationPoints[delegatee].length;
+        if (delegationPointsLength > 0) {
+            // Ensure we copy over the bias and slope from the latest point to the new point
+            Point memory latestPoint = s.delegationPoints[delegatee][delegationPointsLength - 1];
+            newPointForDelegatee.bias = latestPoint.bias;
+            newPointForDelegatee.slope = latestPoint.slope;
+        }
+
+        // Update the slope and bias based on the type of lock (permanent or decay lock)
+        if (s.isPermanent[account]) {
+            // Retrieve weight from permanent stake weight and update the new point
+            // Note: No need to update the slope and slope expiry as it is not affected by the permanent lock
+            newPointForDelegatee.bias += SafeCast.toInt128(int256(s.permanentStakeWeight[account]));
+        } else {
+            // Calculate slope from locked amount (not from bias)
+            LockedBalance memory lock = s.locks[account];
+            int128 accountSlope = lock.amount / SafeCast.toInt128(int256(MAX_LOCK_CAP));
+            int128 accountBias = SafeCast.toInt128(int256(_balanceOf(account, block.timestamp)));
+
+            // Update bias and slope by adding the calculated bias and slope for this delegation
+            newPointForDelegatee.bias += accountBias;
+            newPointForDelegatee.slope += accountSlope;
+
+            // Update the slope expiry for the delegation
+            uint256 expiryWeek = _timestampToFloorWeek(lock.end);
+            s.delegationSlopeExpiry[delegatee][expiryWeek] += accountSlope;
+        }
+
+        // Checkpoint this for the delegatee
+        s.delegationPoints[delegatee].push(newPointForDelegatee);
+
+        // Check if this delegation transfer
+        // If it is, we need to update the delegation points and slope expiry for the old delegatee
+        if (oldDelegatee != address(0)) {
+            // Create a new point for the old delegate
+            Point memory newPointForOldDelegatee = Point({
+                bias: 0,
+                slope: 0,
+                timestamp: block.timestamp,
+                blockNumber: block.number
+            });
+
+            // Retrieve latest point from delegation points
+            uint256 delegationPointsLengthForOldDelegatee = s.delegationPoints[oldDelegatee].length;
+            if (delegationPointsLengthForOldDelegatee > 0) {
+                // Ensure we copy over the bias and slope from the latest point to the new point
+                Point memory latestPoint = s.delegationPoints[oldDelegatee][delegationPointsLengthForOldDelegatee - 1];
+                newPointForOldDelegatee.bias = latestPoint.bias;
+                newPointForOldDelegatee.slope = latestPoint.slope;
+            }
+
+            // Update the slope and bias based on the type of lock (permanent or decay lock)
+            if (s.isPermanent[account]) {
+                // Retrieve weight from permanent stake weight and update the new point
+                // Note: No need to update the slope and slope expiry as it is not affected by the permanent lock
+                newPointForOldDelegatee.bias -= SafeCast.toInt128(int256(s.permanentStakeWeight[account]));
+            } else {
+                // Calculate slope from locked amount (not from bias) - same calculation as when adding
+                LockedBalance memory lock = s.locks[account];
+                int128 accountSlope = lock.amount / SafeCast.toInt128(int256(MAX_LOCK_CAP));
+                int128 accountBias = SafeCast.toInt128(int256(_balanceOf(account, block.timestamp)));
+
+                // Update bias and slope by subtracting the calculated bias and slope for this delegation
+                newPointForOldDelegatee.bias -= accountBias;
+                newPointForOldDelegatee.slope -= accountSlope;
+
+                // Update the slope expiry for the delegation
+                uint256 expiryWeek = _timestampToFloorWeek(lock.end);
+                s.delegationSlopeExpiry[oldDelegatee][expiryWeek] -= accountSlope;
+            }
+
+            // Checkpoint this for the old delegatee
+            s.delegationPoints[oldDelegatee].push(newPointForOldDelegatee);
+        }
     }
 }
