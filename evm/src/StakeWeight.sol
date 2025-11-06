@@ -129,7 +129,6 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
 
         /// ---------------- Delegation storage ----------------
         mapping(address => address) delegates; // maps account to their delegatee
-        mapping(address => uint256) delegationNonces; // Nonces for delegateBySig
         mapping(address => Point[]) delegationPoints; // Checkpoints for delegation.
         mapping(address =>
             mapping(uint256 timestamp => int128 slopeExpiry)
@@ -1653,11 +1652,68 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         return (lastPoint.bias, lastPoint.slope);
     }
 
+    /// @notice Calculate the account's delegation parameters (bias, slope, and expiry)
+    /// @param account The account to calculate delegation parameters for
+    /// @return bias The voting power bias to delegate
+    /// @return slope The decay slope to delegate (0 for permanent locks)
+    /// @return expiryWeek The week when slope expires (0 for permanent locks or expired locks)
+    function _calculateAccountDelegationParams(address account) internal view returns (int128 bias, int128 slope, uint256 expiryWeek) {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+
+        if (s.isPermanent[account]) {
+            // Permanent locks: use permanent stake weight, no slope or expiry
+            bias = SafeCast.toInt128(int256(s.permanentStakeWeight[account]));
+            slope = 0;
+            expiryWeek = 0;
+        } else {
+            // Decay locks: calculate from lock state
+            LockedBalance memory lock = s.locks[account];
+
+            if (lock.amount > 0 && lock.end > block.timestamp) {
+                slope = lock.amount / SafeCast.toInt128(int256(MAX_LOCK_CAP));
+                bias = SafeCast.toInt128(int256(_balanceOf(account, block.timestamp)));
+                expiryWeek = _timestampToFloorWeek(lock.end);
+            } else {
+                // Lock expired or doesn't exist - no contribution
+                bias = 0;
+                slope = 0;
+                expiryWeek = 0;
+            }
+        }
+    }
+
+    /// @notice Update a delegatee's checkpoint with an account's contribution
+    /// @param delegatee The delegatee to update
+    /// @param biasDelta The bias change (positive to add, negative to subtract)
+    /// @param slopeDelta The slope change (positive to add, negative to subtract)
+    /// @param expiryWeek The week when slope expires (0 if no expiry)
+    function _updateDelegateeCheckpoint(address delegatee, int128 biasDelta, int128 slopeDelta, uint256 expiryWeek) internal {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+
+        // Calculate current bias and slope at block.timestamp using piecewise decay
+        (int128 currentBias, int128 currentSlope) = _delegationBiasAndSlopeAt(delegatee, block.timestamp);
+
+        // Create a new point starting from current decayed values
+        Point memory newPoint = Point({
+            bias: currentBias + biasDelta,
+            slope: currentSlope + slopeDelta,
+            timestamp: block.timestamp,
+            blockNumber: block.number
+        });
+
+        // Update slope expiry if this is a decay lock with future expiry
+        if (expiryWeek > 0 && slopeDelta != 0) {
+            s.delegationSlopeExpiry[delegatee][expiryWeek] += slopeDelta;
+        }
+
+        // Checkpoint this for the delegatee
+        s.delegationPoints[delegatee].push(newPoint);
+    }
+
     /// @notice Internal function to delegate votes from an account to a delegatee
     /// @param account The account to delegate from
     /// @param delegatee The address to delegate to
     function _delegate(address account, address delegatee) internal {
-
         StakeWeightStorage storage s = _getStakeWeightStorage();
         address oldDelegatee = s.delegates[account];
 
@@ -1666,88 +1722,15 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         // Update delegation storage
         s.delegates[account] = delegatee;
 
-        // Calculate current bias and slope at block.timestamp using piecewise decay
-        (int128 currentBias, int128 currentSlope) = _delegationBiasAndSlopeAt(delegatee, block.timestamp);
+        // Calculate account's delegation parameters
+        (int128 accountBias, int128 accountSlope, uint256 expiryWeek) = _calculateAccountDelegationParams(account);
 
-        // Create a new point for the delegation starting from current decayed values
-        Point memory newPointForDelegatee = Point({
-            bias: currentBias,
-            slope: currentSlope,
-            timestamp: block.timestamp,
-            blockNumber: block.number
-        });
+        // Add contribution to new delegatee
+        _updateDelegateeCheckpoint(delegatee, accountBias, accountSlope, expiryWeek);
 
-        // Update the slope and bias based on the type of lock (permanent or decay lock)
-        if (s.isPermanent[account]) {
-            // Retrieve weight from permanent stake weight and update the new point
-            // Note: No need to update the slope and slope expiry as it is not affected by the permanent lock
-            newPointForDelegatee.bias += SafeCast.toInt128(int256(s.permanentStakeWeight[account]));
-        } else {
-            // Calculate slope from locked amount (not from bias)
-            LockedBalance memory lock = s.locks[account];
-
-            // Check if lock exists and is not expired
-            if (lock.amount > 0 && lock.end > block.timestamp) {
-                int128 accountSlope = lock.amount / SafeCast.toInt128(int256(MAX_LOCK_CAP));
-                int128 accountBias = SafeCast.toInt128(int256(_balanceOf(account, block.timestamp)));
-
-                // Update bias and slope by adding the calculated bias and slope for this delegation
-                newPointForDelegatee.bias += accountBias;
-                newPointForDelegatee.slope += accountSlope;
-
-                // Update the slope expiry for the delegation (only for active locks with future expiry)
-                uint256 expiryWeek = _timestampToFloorWeek(lock.end);
-                s.delegationSlopeExpiry[delegatee][expiryWeek] += accountSlope;
-            }
-            // If lock is expired or doesn't exist, skip delegation (no voting power to delegate)
-        }
-
-        // Checkpoint this for the delegatee
-        s.delegationPoints[delegatee].push(newPointForDelegatee);
-
-        // Check if this delegation transfer
-        // If it is, we need to update the delegation points and slope expiry for the old delegatee
+        // Remove contribution from old delegatee (if exists)
         if (oldDelegatee != address(0)) {
-            // Calculate current bias and slope at block.timestamp using piecewise decay
-            (int128 currentBiasOld, int128 currentSlopeOld) = _delegationBiasAndSlopeAt(oldDelegatee, block.timestamp);
-
-            // Create a new point for the old delegate starting from current decayed values
-            Point memory newPointForOldDelegatee = Point({
-                bias: currentBiasOld,
-                slope: currentSlopeOld,
-                timestamp: block.timestamp,
-                blockNumber: block.number
-            });
-
-            // Update the slope and bias based on the type of lock (permanent or decay lock)
-            if (s.isPermanent[account]) {
-                // Retrieve weight from permanent stake weight and update the new point
-                // Note: No need to update the slope and slope expiry as it is not affected by the permanent lock
-                newPointForOldDelegatee.bias -= SafeCast.toInt128(int256(s.permanentStakeWeight[account]));
-            } else {
-                // Calculate slope from locked amount (not from bias) - same calculation as when adding
-                LockedBalance memory lock = s.locks[account];
-
-                // Check if lock exists and is not expired
-                // Note: We need to remove delegation even if lock is now expired, but only if it was active when delegated
-                // For simplicity, we check current state - if expired, there's nothing to remove
-                if (lock.amount > 0 && lock.end > block.timestamp) {
-                    int128 accountSlope = lock.amount / SafeCast.toInt128(int256(MAX_LOCK_CAP));
-                    int128 accountBias = SafeCast.toInt128(int256(_balanceOf(account, block.timestamp)));
-
-                    // Update bias and slope by subtracting the calculated bias and slope for this delegation
-                    newPointForOldDelegatee.bias -= accountBias;
-                    newPointForOldDelegatee.slope -= accountSlope;
-
-                    // Update the slope expiry for the delegation (only for active locks with future expiry)
-                    uint256 expiryWeek = _timestampToFloorWeek(lock.end);
-                    s.delegationSlopeExpiry[oldDelegatee][expiryWeek] -= accountSlope;
-                }
-                // If lock is expired or doesn't exist, skip removal (no voting power to remove)
-            }
-
-            // Checkpoint this for the old delegatee
-            s.delegationPoints[oldDelegatee].push(newPointForOldDelegatee);
+            _updateDelegateeCheckpoint(oldDelegatee, -accountBias, -accountSlope, expiryWeek);
         }
     }
 }
