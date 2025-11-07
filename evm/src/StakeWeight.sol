@@ -53,6 +53,14 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         uint256 transferredAmount;
     }
 
+    /// @notice A struct representing delegation information
+    struct DelegationInfo {
+        /// @notice The delegatee address
+        address delegatee;
+        /// @notice Original expiry week when delegation was added
+        uint256 originalExpiryWeek;
+    }
+
     /// @notice Initialization parameters for the StakeWeight contract
     struct Init {
         /// @notice The address of the admin
@@ -128,7 +136,7 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
             // stake weight at that user point
 
         /// ---------------- Delegation storage ----------------
-        mapping(address => address) delegates; // maps account to their delegatee
+        mapping(address => DelegationInfo) delegates; // maps account to their delegation info (delegatee + originalExpiryWeek)
         mapping(address => Point[]) delegationPoints; // Checkpoints for delegation.
         mapping(address =>
             mapping(uint256 timestamp => int128 slopeExpiry)
@@ -1547,7 +1555,7 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
     /// @return The delegate of the account
     function delegates(address account) external view returns (address) {
         StakeWeightStorage storage s = _getStakeWeightStorage();
-       return s.delegates[account];
+        return s.delegates[account].delegatee;
     }
 
     /// @notice Delegate votes from the sender to `delegatee`.
@@ -1696,7 +1704,7 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         Point memory userNewPoint
     ) internal {
         StakeWeightStorage storage s = _getStakeWeightStorage();
-        address delegatee = s.delegates[account];
+        address delegatee = s.delegates[account].delegatee;
 
         // If user has no delegate, nothing to update
         if (delegatee == address(0)) {
@@ -1752,9 +1760,12 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
             return;
         }
 
-        // Remove old contribution (using prevExpiryWeek for cleanup)
+        // Remove old contribution (using ORIGINAL expiryWeek for cleanup, not current prevExpiryWeek)
+        // This is critical: if user converted from decay to permanent, prevExpiryWeek would be 0,
+        // but we need the original expiryWeek to clean up the correct slopeExpiry entry
         if (prevHasContribution) {
-            _updateDelegateeCheckpoint(delegatee, -prevBias, -prevSlope, prevExpiryWeek);
+            uint256 originalExpiryWeek = s.delegates[account].originalExpiryWeek;
+            _updateDelegateeCheckpoint(delegatee, -prevBias, -prevSlope, originalExpiryWeek);
         }
 
         // Add new contribution
@@ -1790,6 +1801,16 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
 
         // Checkpoint this for the delegatee
         s.delegationPoints[delegatee].push(newPoint);
+
+        // ASK: NOT SURE IF THIS IS CORRECT
+        // Get old voting power (clamp to 0 if negative)
+        uint256 oldVotes = currentBias < 0 ? 0 : uint256(uint128(currentBias));
+        // Get new voting power (clamp to 0 if negative)
+        uint256 newVotes = newPoint.bias < 0 ? 0 : uint256(uint128(newPoint.bias));
+        // Emit DelegateVotesChanged event (only if votes actually changed)
+        if (oldVotes != newVotes) {
+            emit DelegateVotesChanged(delegatee, oldVotes, newVotes);
+        }
     }
 
     /// @notice Internal function to delegate votes from an account to a delegatee
@@ -1797,14 +1818,11 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
     /// @param delegatee The address to delegate to
     function _delegate(address account, address delegatee) internal {
         StakeWeightStorage storage s = _getStakeWeightStorage();
-        address oldDelegatee = s.delegates[account];
+        address oldDelegatee = s.delegates[account].delegatee;
 
         emit DelegateChanged(account, oldDelegatee, delegatee);
 
-        // Update delegation storage
-        s.delegates[account] = delegatee;
-
-        // Calculate account's delegation parameters
+        // Calculate current params for new delegation
         (int128 accountBias, int128 accountSlope, uint256 expiryWeek) = _calculateAccountDelegationParams(account);
 
         // Add contribution to new delegatee
@@ -1812,7 +1830,25 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
 
         // Remove contribution from old delegatee (if exists)
         if (oldDelegatee != address(0)) {
-            _updateDelegateeCheckpoint(oldDelegatee, -accountBias, -accountSlope, expiryWeek);
+            // Use ORIGINAL expiryWeek for cleanup, not current state
+            uint256 originalExpiryWeek = s.delegates[account].originalExpiryWeek;
+
+            // Calculate current bias/slope for removal (current state)
+            (int128 currentBias, int128 currentSlope, ) = _calculateAccountDelegationParams(account);
+
+            // Remove using current bias/slope but ORIGINAL expiryWeek for cleanup
+            _updateDelegateeCheckpoint(
+                oldDelegatee,
+                -currentBias,
+                -currentSlope,
+                originalExpiryWeek  // Use original, not current!
+            );
         }
+
+        // Update delegation storage with new delegatee and original expiryWeek
+        s.delegates[account] = DelegationInfo({
+            delegatee: delegatee,
+            originalExpiryWeek: expiryWeek
+        });
     }
 }
