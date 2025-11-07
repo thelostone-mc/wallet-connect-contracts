@@ -608,6 +608,9 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
                     s.slopeChanges[newLocked.end] = newSlopeDelta;
                 }
             }
+
+            // Update delegation state if user has delegated
+            _checkpointDelegate(address_, prevLocked, newLocked, userPrevPoint, userNewPoint);
         }
     }
 
@@ -1528,9 +1531,6 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         // We might have to do the same for getPastVotes
     }
 
-    function syncDelegation(address account) external {
-        // Sync the delegation points and slope expiry for the account
-    }
 
     /// @notice Returns the amount of votes that `account` had at a specific moment in the past.
     function getPastVotes(address account, uint256 timepoint) external view returns (uint256) {
@@ -1682,11 +1682,92 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         }
     }
 
+    /// @notice Update delegation state when a user's lock changes via checkpoint
+    /// @param account The account whose lock changed
+    /// @param prevLocked The previous lock state
+    /// @param newLocked The new lock state
+    /// @param userPrevPoint The previous point calculated in _checkpoint (for decay locks)
+    /// @param userNewPoint The new point calculated in _checkpoint (for decay locks)
+    function _checkpointDelegate(
+        address account,
+        LockedBalance memory prevLocked,
+        LockedBalance memory newLocked,
+        Point memory userPrevPoint,
+        Point memory userNewPoint
+    ) internal {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+        address delegatee = s.delegates[account];
+
+        // If user has no delegate, nothing to update
+        if (delegatee == address(0)) {
+            return;
+        }
+
+        // Calculate delegation params for previous lock state
+        int128 prevBias;
+        int128 prevSlope;
+        uint256 prevExpiryWeek;
+        bool prevHasContribution;
+
+        if (s.isPermanent[account] && prevLocked.end == 0) {
+            // Permanent lock: use permanent stake weight, no slope or expiry
+            prevBias = SafeCast.toInt128(int256(s.permanentStakeWeight[account]));
+            prevSlope = 0;
+            prevExpiryWeek = 0;
+            prevHasContribution = prevBias != 0;
+        } else {
+            // Decay lock: reuse values from _checkpoint (already calculated)
+            prevBias = userPrevPoint.bias;
+            prevSlope = userPrevPoint.slope;
+            prevExpiryWeek = prevLocked.end > 0 ? _timestampToFloorWeek(prevLocked.end) : 0;
+            prevHasContribution = prevBias != 0 || prevSlope != 0;
+        }
+
+        // Calculate delegation params for new lock state
+        int128 newBias;
+        int128 newSlope;
+        uint256 newExpiryWeek;
+        bool newHasContribution;
+
+        if (s.isPermanent[account] && newLocked.end == 0) {
+            // Permanent lock: use permanent stake weight, no slope or expiry
+            newBias = SafeCast.toInt128(int256(s.permanentStakeWeight[account]));
+            newSlope = 0;
+            newExpiryWeek = 0;
+            newHasContribution = newBias != 0;
+        } else {
+            // Decay lock: reuse values from _checkpoint (already calculated)
+            newBias = userNewPoint.bias;
+            newSlope = userNewPoint.slope;
+            newExpiryWeek = newLocked.end > 0 ? _timestampToFloorWeek(newLocked.end) : 0;
+            newHasContribution = newBias != 0 || newSlope != 0;
+        }
+
+        // Calculate deltas
+        int128 biasDelta = newBias - prevBias;
+        int128 slopeDelta = newSlope - prevSlope;
+
+        // If nothing changed, skip update
+        if (biasDelta == 0 && slopeDelta == 0) {
+            return;
+        }
+
+        // Remove old contribution (using prevExpiryWeek for cleanup)
+        if (prevHasContribution) {
+            _updateDelegateeCheckpoint(delegatee, -prevBias, -prevSlope, prevExpiryWeek);
+        }
+
+        // Add new contribution
+        if (newHasContribution) {
+            _updateDelegateeCheckpoint(delegatee, newBias, newSlope, newExpiryWeek);
+        }
+    }
+
     /// @notice Update a delegatee's checkpoint with an account's contribution
     /// @param delegatee The delegatee to update
     /// @param biasDelta The bias change (positive to add, negative to subtract)
     /// @param slopeDelta The slope change (positive to add, negative to subtract)
-    /// @param expiryWeek The week when slope expires (0 if no expiry)
+    /// @param expiryWeek The week when slope expires (0 if no expiry). For removals, this should be the ORIGINAL expiryWeek when delegation was added.
     function _updateDelegateeCheckpoint(address delegatee, int128 biasDelta, int128 slopeDelta, uint256 expiryWeek) internal {
         StakeWeightStorage storage s = _getStakeWeightStorage();
 
@@ -1702,6 +1783,7 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         });
 
         // Update slope expiry if this is a decay lock with future expiry
+        // For removals, expiryWeek should be the ORIGINAL expiryWeek to properly clean up
         if (expiryWeek > 0 && slopeDelta != 0) {
             s.delegationSlopeExpiry[delegatee][expiryWeek] += slopeDelta;
         }
