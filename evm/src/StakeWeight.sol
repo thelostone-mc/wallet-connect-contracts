@@ -1521,13 +1521,6 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
 
     // ----- Delegation -----
 
-    /// @notice Update the delegation storage vars when weight changes
-    // function _updateDelegateVotes(address user, uint256 oldWeight, uint256 newWeight) internal {
-        /// Currently: Any time weight changes, we call update _checkpoint()
-        /// Changes to make: Update _checkpoint() to invoke _updateDelegateVotes()
-        /// NOTE: Will have to account for both permanent lock and decay lock to see how that affects the delegation updates
-    // }
-
     /// @notice Get the current voting power of an account
     function getVotes(address account) external view returns (uint256) {
         /// How do we handle self delegation initlization after we roll this out?
@@ -1771,6 +1764,13 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         // Add new contribution
         if (newHasContribution) {
             _updateDelegateeCheckpoint(delegatee, newBias, newSlope, newExpiryWeek);
+            // Update stored expiryWeek to match new lock state
+            // For permanent locks: newExpiryWeek = 0 (correct, no expiry)
+            // For decay locks: newExpiryWeek = actual expiry week
+            s.delegates[account].originalExpiryWeek = newExpiryWeek;
+        } else {
+            // If the account no longer contributes (lock expired/withdrawn), clear the stored expiry
+            s.delegates[account].originalExpiryWeek = 0;
         }
     }
 
@@ -1802,7 +1802,6 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         // Checkpoint this for the delegatee
         s.delegationPoints[delegatee].push(newPoint);
 
-        // ASK: NOT SURE IF THIS IS CORRECT
         // Get old voting power (clamp to 0 if negative)
         uint256 oldVotes = currentBias < 0 ? 0 : uint256(uint128(currentBias));
         // Get new voting power (clamp to 0 if negative)
