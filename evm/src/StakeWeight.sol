@@ -1521,26 +1521,32 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
 
     // ----- Delegation -----
 
-    /// @notice Get the current voting power of an account
+    /// @notice Returns the current amount of votes that `account` has.
+    /// @param account The account to query
+    /// @return The current voting power of the account (from delegated votes)
     function getVotes(address account) external view returns (uint256) {
-        /// How do we handle self delegation initlization after we roll this out?
-        /// If Alice has voting power of 100 and she hasnt interacted with out system after upgrade
-        /// Assuming no one has delegated to her, she will still have 0 votes cause she has not self delegated
+        (int128 currentBias, ) = _delegationBiasAndSlopeAt(account, block.timestamp);
 
-
-        // We could do check to see if delegation checkpoint does not exist -> create a new one
-        // We might have to do the same for getPastVotes
+        return uint256(uint128(currentBias));
     }
 
 
     /// @notice Returns the amount of votes that `account` had at a specific moment in the past.
+    /// @param account The account to query
+    /// @param timepoint The timestamp to query
+    /// @return The amount of votes that `account` had at the specified timestamp
     function getPastVotes(address account, uint256 timepoint) external view returns (uint256) {
-        // TODO
+        (int128 currentBias, ) = _delegationBiasAndSlopeAt(account, timepoint);
+
+        return uint256(uint128(currentBias));
     }
 
     /// @notice Returns the total supply of votes available at a specific moment in the past.
+    /// @param timepoint The timestamp to query (must be in the past)
+    /// @return The total supply of votes at the specified timestamp
     function getPastTotalSupply(uint256 timepoint) external view returns (uint256) {
-        // TODO
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+        return _totalSupplyAt(s.pointHistory[s.epoch], timepoint);
     }
 
     /// @notice Returns the delegate that `account` has chosen.
@@ -1602,14 +1608,12 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         // Get the most recent checkpoint
         Point memory lastPoint = s.delegationPoints[delegatee][delegationPointsLength - 1];
 
-        // If timestamp is before the checkpoint, return checkpoint values (shouldn't happen in practice)
-        if (timestamp < lastPoint.timestamp) {
-            return (lastPoint.bias, lastPoint.slope);
-        }
-
-        // If timestamp equals checkpoint timestamp, return checkpoint values directly
-        if (timestamp == lastPoint.timestamp) {
-            return (lastPoint.bias, lastPoint.slope);
+        // If timestamp is at or before the checkpoint, return checkpoint values directly
+        // (timestamp < checkpoint shouldn't happen in practice, but we handle it defensively)
+        if (timestamp <= lastPoint.timestamp) {
+            // Clamp bias to zero if negative (checkpoint may have negative bias from over-removal)
+            int128 _bias = lastPoint.bias < 0 ? int128(0) : lastPoint.bias;
+            return (_bias, lastPoint.slope);
         }
 
         // Perform piecewise decay from checkpoint timestamp to target timestamp
