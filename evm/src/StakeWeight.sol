@@ -5,9 +5,13 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import { AccessControlUpgradeable } from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import { ReentrancyGuardUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import { EIP712Upgradeable } from "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
+import { NoncesUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/NoncesUpgradeable.sol";
 import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { IVotes } from "@openzeppelin/contracts/governance/utils/IVotes.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import { Pauser } from "./Pauser.sol";
 import { WalletConnectConfig } from "./WalletConnectConfig.sol";
@@ -20,7 +24,7 @@ import { L2WCT } from "./L2WCT.sol";
  * @author WalletConnect
  */
 
-contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable {
+contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, IVotes, EIP712Upgradeable, NoncesUpgradeable {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////////////////
@@ -47,6 +51,14 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         uint256 end;
         /// @notice The transferred tokens (if any)
         uint256 transferredAmount;
+    }
+
+    /// @notice A struct representing delegation information
+    struct DelegationInfo {
+        /// @notice The delegatee address
+        address delegatee;
+        /// @notice Original expiry week when delegation was added
+        uint256 originalExpiryWeek;
     }
 
     /// @notice Initialization parameters for the StakeWeight contract
@@ -81,6 +93,8 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
     // Roles
     // @dev Role for the locked token staker, needs to happen after deployment for circular dependency
     bytes32 public constant LOCKED_TOKEN_STAKER_ROLE = keccak256("LOCKED_TOKEN_STAKER_ROLE");
+
+    bytes32 private constant DELEGATION_TYPEHASH = keccak256("Delegation(address delegatee,uint256 nonce,uint256 expiry)");
 
     /*//////////////////////////////////////////////////////////////////////////
                                     STORAGE
@@ -120,6 +134,13 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
         mapping(uint256 => uint256) globalPermanentSupplyAtEpoch; // epoch -> permanentTotalSupply at that global point
         mapping(address => mapping(uint256 => uint256)) userPermanentWeightAtEpoch; // user, userEpoch -> permanent
             // stake weight at that user point
+
+        /// ---------------- Delegation storage ----------------
+        mapping(address => DelegationInfo) delegates; // maps account to their delegation info (delegatee + originalExpiryWeek)
+        mapping(address => Point[]) delegationPoints; // Checkpoints for delegation.
+        mapping(address =>
+            mapping(uint256 timestamp => int128 slopeExpiry)
+        ) delegationSlopeExpiry; // Slope expiry for delegation.
     }
 
     function _getStakeWeightStorage() internal pure returns (StakeWeightStorage storage s) {
@@ -595,6 +616,9 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
                     s.slopeChanges[newLocked.end] = newSlopeDelta;
                 }
             }
+
+            // Update delegation state if user has delegated
+            _checkpointDelegate(address_, prevLocked, newLocked, userPrevPoint, userNewPoint);
         }
     }
 
@@ -1493,5 +1517,341 @@ contract StakeWeight is Initializable, AccessControlUpgradeable, ReentrancyGuard
     function permanentBaseWeeks(address user) external view returns (uint256) {
         StakeWeightStorage storage s = _getStakeWeightStorage();
         return s.permanentBaseWeeks[user];
+    }
+
+    // ----- Delegation -----
+
+    /// @notice Returns the current amount of votes that `account` has.
+    /// @param account The account to query
+    /// @return The current voting power of the account (from delegated votes)
+    function getVotes(address account) external view returns (uint256) {
+        (int128 currentBias, ) = _delegationBiasAndSlopeAt(account, block.timestamp);
+
+        return uint256(uint128(currentBias));
+    }
+
+
+    /// @notice Returns the amount of votes that `account` had at a specific moment in the past.
+    /// @param account The account to query
+    /// @param timepoint The timestamp to query
+    /// @return The amount of votes that `account` had at the specified timestamp
+    function getPastVotes(address account, uint256 timepoint) external view returns (uint256) {
+        (int128 currentBias, ) = _delegationBiasAndSlopeAt(account, timepoint);
+
+        return uint256(uint128(currentBias));
+    }
+
+    /// @notice Returns the total supply of votes available at a specific moment in the past.
+    /// @param timepoint The timestamp to query (must be in the past)
+    /// @return The total supply of votes at the specified timestamp
+    function getPastTotalSupply(uint256 timepoint) external view returns (uint256) {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+        return _totalSupplyAt(s.pointHistory[s.epoch], timepoint);
+    }
+
+    /// @notice Returns the delegate that `account` has chosen.
+    /// @param account The account to query
+    /// @return The delegate of the account
+    function delegates(address account) external view returns (address) {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+        return s.delegates[account].delegatee;
+    }
+
+    /// @notice Delegate votes from the sender to `delegatee`.
+    /// @param delegatee The address to delegate to
+    function delegate(address delegatee) external {
+        _delegate(msg.sender, delegatee);
+    }
+
+    /// @notice Delegates votes from signer to `delegatee`.
+    /// @param delegatee The address to delegate to
+    /// @param nonce The nonce for the signature
+    /// @param expiry The expiry for the signature
+    /// @param v The v component of the signature
+    /// @param r The r component of the signature
+    /// @param s The s component of the signature
+    function delegateBySig(
+        address delegatee,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        if (block.timestamp > expiry) {
+            revert VotesExpiredSignature(expiry);
+        }
+        address signer = ECDSA.recover(
+            _hashTypedDataV4(keccak256(abi.encode(DELEGATION_TYPEHASH, delegatee, nonce, expiry))),
+            v,
+            r,
+            s
+        );
+        _useCheckedNonce(signer, nonce);
+        _delegate(signer, delegatee);
+    }
+
+    /// @notice Calculate delegation bias and slope at a specific timestamp using piecewise decay
+    /// @param delegatee The delegatee address
+    /// @param timestamp The timestamp to calculate bias and slope at
+    /// @return bias The decayed bias at the timestamp
+    /// @return slope The current slope at the timestamp (after applying expirations)
+    function _delegationBiasAndSlopeAt(address delegatee, uint256 timestamp) internal view returns (int128 bias, int128 slope) {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+        uint256 delegationPointsLength = s.delegationPoints[delegatee].length;
+
+        // If no checkpoints exist, return zero
+        if (delegationPointsLength == 0) {
+            return (0, 0);
+        }
+
+        // Get the most recent checkpoint
+        Point memory lastPoint = s.delegationPoints[delegatee][delegationPointsLength - 1];
+
+        // If timestamp is at or before the checkpoint, return checkpoint values directly
+        // (timestamp < checkpoint shouldn't happen in practice, but we handle it defensively)
+        if (timestamp <= lastPoint.timestamp) {
+            // Clamp bias to zero if negative (checkpoint may have negative bias from over-removal)
+            int128 _bias = lastPoint.bias < 0 ? int128(0) : lastPoint.bias;
+            return (_bias, lastPoint.slope);
+        }
+
+        // Perform piecewise decay from checkpoint timestamp to target timestamp
+        uint256 weekCursor = _timestampToFloorWeek(lastPoint.timestamp);
+
+        // Iterate through weeks to apply slopeExpiry changes
+        for (uint256 i = 0; i < MAX_CHECKPOINT_ITERATIONS; i++) {
+            weekCursor = weekCursor + 1 weeks;
+            int128 slopeDelta = 0;
+
+            if (weekCursor > timestamp) {
+                // If weekCursor goes beyond timestamp, set to timestamp and don't check slopeExpiry
+                weekCursor = timestamp;
+            } else {
+                // Check for slope expiry at this week boundary
+                slopeDelta = s.delegationSlopeExpiry[delegatee][weekCursor];
+            }
+
+            // Decay bias from lastPoint.timestamp to weekCursor
+            int128 timeElapsed = SafeCast.toInt128(int256(weekCursor - lastPoint.timestamp));
+            lastPoint.bias = lastPoint.bias - (lastPoint.slope * timeElapsed);
+
+            // Clamp bias to zero if negative
+            if (lastPoint.bias < 0) {
+                lastPoint.bias = 0;
+            }
+
+            // If we've reached the target timestamp, break
+            if (weekCursor == timestamp) {
+                break;
+            }
+
+            // Apply slope change from expirations and update timestamp
+            lastPoint.slope = lastPoint.slope - slopeDelta; // Subtract because expirations reduce slope
+            if (lastPoint.slope < 0) {
+                lastPoint.slope = 0;
+            }
+            lastPoint.timestamp = weekCursor;
+        }
+
+        return (lastPoint.bias, lastPoint.slope);
+    }
+
+    /// @notice Calculate the account's delegation parameters (bias, slope, and expiry)
+    /// @param account The account to calculate delegation parameters for
+    /// @return bias The voting power bias to delegate
+    /// @return slope The decay slope to delegate (0 for permanent locks)
+    /// @return expiryWeek The week when slope expires (0 for permanent locks or expired locks)
+    function _calculateAccountDelegationParams(address account) internal view returns (int128 bias, int128 slope, uint256 expiryWeek) {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+
+        if (s.isPermanent[account]) {
+            // Permanent locks: use permanent stake weight, no slope or expiry
+            bias = SafeCast.toInt128(int256(s.permanentStakeWeight[account]));
+            slope = 0;
+            expiryWeek = 0;
+        } else {
+            // Decay locks: calculate from lock state
+            LockedBalance memory lock = s.locks[account];
+
+            if (lock.amount > 0 && lock.end > block.timestamp) {
+                slope = lock.amount / SafeCast.toInt128(int256(MAX_LOCK_CAP));
+                bias = SafeCast.toInt128(int256(_balanceOf(account, block.timestamp)));
+                expiryWeek = _timestampToFloorWeek(lock.end);
+            } else {
+                // Lock expired or doesn't exist - no contribution
+                bias = 0;
+                slope = 0;
+                expiryWeek = 0;
+            }
+        }
+    }
+
+    /// @notice Update delegation state when a user's lock changes via checkpoint
+    /// @param account The account whose lock changed
+    /// @param prevLocked The previous lock state
+    /// @param newLocked The new lock state
+    /// @param userPrevPoint The previous point calculated in _checkpoint (for decay locks)
+    /// @param userNewPoint The new point calculated in _checkpoint (for decay locks)
+    function _checkpointDelegate(
+        address account,
+        LockedBalance memory prevLocked,
+        LockedBalance memory newLocked,
+        Point memory userPrevPoint,
+        Point memory userNewPoint
+    ) internal {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+        address delegatee = s.delegates[account].delegatee;
+
+        // If user has no delegate, nothing to update
+        if (delegatee == address(0)) {
+            return;
+        }
+
+        // Calculate delegation params for previous lock state
+        int128 prevBias;
+        int128 prevSlope;
+        uint256 prevExpiryWeek;
+        bool prevHasContribution;
+
+        if (s.isPermanent[account] && prevLocked.end == 0) {
+            // Permanent lock: use permanent stake weight, no slope or expiry
+            prevBias = SafeCast.toInt128(int256(s.permanentStakeWeight[account]));
+            prevSlope = 0;
+            prevExpiryWeek = 0;
+            prevHasContribution = prevBias != 0;
+        } else {
+            // Decay lock: reuse values from _checkpoint (already calculated)
+            prevBias = userPrevPoint.bias;
+            prevSlope = userPrevPoint.slope;
+            prevExpiryWeek = prevLocked.end > 0 ? _timestampToFloorWeek(prevLocked.end) : 0;
+            prevHasContribution = prevBias != 0 || prevSlope != 0;
+        }
+
+        // Calculate delegation params for new lock state
+        int128 newBias;
+        int128 newSlope;
+        uint256 newExpiryWeek;
+        bool newHasContribution;
+
+        if (s.isPermanent[account] && newLocked.end == 0) {
+            // Permanent lock: use permanent stake weight, no slope or expiry
+            newBias = SafeCast.toInt128(int256(s.permanentStakeWeight[account]));
+            newSlope = 0;
+            newExpiryWeek = 0;
+            newHasContribution = newBias != 0;
+        } else {
+            // Decay lock: reuse values from _checkpoint (already calculated)
+            newBias = userNewPoint.bias;
+            newSlope = userNewPoint.slope;
+            newExpiryWeek = newLocked.end > 0 ? _timestampToFloorWeek(newLocked.end) : 0;
+            newHasContribution = newBias != 0 || newSlope != 0;
+        }
+
+        // Calculate deltas
+        int128 biasDelta = newBias - prevBias;
+        int128 slopeDelta = newSlope - prevSlope;
+
+        // If nothing changed, skip update
+        if (biasDelta == 0 && slopeDelta == 0) {
+            return;
+        }
+
+        // Remove old contribution (using ORIGINAL expiryWeek for cleanup, not current prevExpiryWeek)
+        // This is critical: if user converted from decay to permanent, prevExpiryWeek would be 0,
+        // but we need the original expiryWeek to clean up the correct slopeExpiry entry
+        if (prevHasContribution) {
+            uint256 originalExpiryWeek = s.delegates[account].originalExpiryWeek;
+            _updateDelegateeCheckpoint(delegatee, -prevBias, -prevSlope, originalExpiryWeek);
+        }
+
+        // Add new contribution
+        if (newHasContribution) {
+            _updateDelegateeCheckpoint(delegatee, newBias, newSlope, newExpiryWeek);
+            // Update stored expiryWeek to match new lock state
+            // For permanent locks: newExpiryWeek = 0 (correct, no expiry)
+            // For decay locks: newExpiryWeek = actual expiry week
+            s.delegates[account].originalExpiryWeek = newExpiryWeek;
+        } else {
+            // If the account no longer contributes (lock expired/withdrawn), clear the stored expiry
+            s.delegates[account].originalExpiryWeek = 0;
+        }
+    }
+
+    /// @notice Update a delegatee's checkpoint with an account's contribution
+    /// @param delegatee The delegatee to update
+    /// @param biasDelta The bias change (positive to add, negative to subtract)
+    /// @param slopeDelta The slope change (positive to add, negative to subtract)
+    /// @param expiryWeek The week when slope expires (0 if no expiry). For removals, this should be the ORIGINAL expiryWeek when delegation was added.
+    function _updateDelegateeCheckpoint(address delegatee, int128 biasDelta, int128 slopeDelta, uint256 expiryWeek) internal {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+
+        // Calculate current bias and slope at block.timestamp using piecewise decay
+        (int128 currentBias, int128 currentSlope) = _delegationBiasAndSlopeAt(delegatee, block.timestamp);
+
+        // Create a new point starting from current decayed values
+        Point memory newPoint = Point({
+            bias: currentBias + biasDelta,
+            slope: currentSlope + slopeDelta,
+            timestamp: block.timestamp,
+            blockNumber: block.number
+        });
+
+        // Update slope expiry if this is a decay lock with future expiry
+        // For removals, expiryWeek should be the ORIGINAL expiryWeek to properly clean up
+        if (expiryWeek > 0 && slopeDelta != 0) {
+            s.delegationSlopeExpiry[delegatee][expiryWeek] += slopeDelta;
+        }
+
+        // Checkpoint this for the delegatee
+        s.delegationPoints[delegatee].push(newPoint);
+
+        // Get old voting power (clamp to 0 if negative)
+        uint256 oldVotes = currentBias < 0 ? 0 : uint256(uint128(currentBias));
+        // Get new voting power (clamp to 0 if negative)
+        uint256 newVotes = newPoint.bias < 0 ? 0 : uint256(uint128(newPoint.bias));
+        // Emit DelegateVotesChanged event (only if votes actually changed)
+        if (oldVotes != newVotes) {
+            emit DelegateVotesChanged(delegatee, oldVotes, newVotes);
+        }
+    }
+
+    /// @notice Internal function to delegate votes from an account to a delegatee
+    /// @param account The account to delegate from
+    /// @param delegatee The address to delegate to
+    function _delegate(address account, address delegatee) internal {
+        StakeWeightStorage storage s = _getStakeWeightStorage();
+        address oldDelegatee = s.delegates[account].delegatee;
+
+        emit DelegateChanged(account, oldDelegatee, delegatee);
+
+        // Calculate current params for new delegation
+        (int128 accountBias, int128 accountSlope, uint256 expiryWeek) = _calculateAccountDelegationParams(account);
+
+        // Add contribution to new delegatee
+        _updateDelegateeCheckpoint(delegatee, accountBias, accountSlope, expiryWeek);
+
+        // Remove contribution from old delegatee (if exists)
+        if (oldDelegatee != address(0)) {
+            // Use ORIGINAL expiryWeek for cleanup, not current state
+            uint256 originalExpiryWeek = s.delegates[account].originalExpiryWeek;
+
+            // Calculate current bias/slope for removal (current state)
+            (int128 currentBias, int128 currentSlope, ) = _calculateAccountDelegationParams(account);
+
+            // Remove using current bias/slope but ORIGINAL expiryWeek for cleanup
+            _updateDelegateeCheckpoint(
+                oldDelegatee,
+                -currentBias,
+                -currentSlope,
+                originalExpiryWeek  // Use original, not current!
+            );
+        }
+
+        // Update delegation storage with new delegatee and original expiryWeek
+        s.delegates[account] = DelegationInfo({
+            delegatee: delegatee,
+            originalExpiryWeek: expiryWeek
+        });
     }
 }
